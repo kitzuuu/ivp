@@ -11,6 +11,7 @@ from PIL import Image
 from torch import nn
 from torch.nn import functional as F
 from torch.utils.data import DataLoader, Dataset
+from torchvision.transforms import v2
 
 
 @dataclass(frozen=True)
@@ -39,13 +40,15 @@ def set_seed(seed: int) -> None:
 
 def resolve_device(device: str) -> torch.device:
     if device == "auto":
-        return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        if torch.cuda.is_available():
+            return torch.device("cuda")
+        elif torch.backends.mps.is_available():
+            return torch.device("mps")
+        else:
+            return torch.device("cpu")
+            
     if device == "cuda" and not torch.cuda.is_available():
-        raise RuntimeError(
-            "CUDA cannot be used"
-            f"torch={torch.__version__}, torch.version.cuda={torch.version.cuda!r} "
-            "No CUDA installation found"
-        )
+        raise RuntimeError("No CUDA installation found")
     return torch.device(device)
 
 
@@ -72,12 +75,18 @@ class HindiDigitDataset(Dataset):
             self.images.append(x)
             self.labels.append(label)
         self.augment = augment
+        self.transforms = v2.Compose([
+            v2.RandomRotation(degrees=10),
+            v2.RandomAffine(degrees=0, translate=(0.1,0.1),scale=(0.9,1.1)),
+        ]) if augment else None
 
     def __len__(self) -> int:
         return len(self.images)
 
     def __getitem__(self, index: int):
         x = self.images[index]
+        if self.transforms:
+            x=self.transforms(x)
         if self.augment:
             if random.random() < 0.75:
                 x = self._translate(x, max_shift=3)
@@ -128,7 +137,10 @@ class DigitCNN(nn.Module):
         self.classifier = nn.Sequential(
             nn.Flatten(),
             nn.Dropout(0.30),
-            nn.Linear(128, 10),
+            nn.Linear(128, 64),
+            nn.ReLU(inplace=True),
+            nn.Dropout(0.15),
+            nn.Linear(64, 10),
         )
 
     @staticmethod
@@ -169,20 +181,31 @@ def train_one_epoch(
     loader: DataLoader,
     optimizer: torch.optim.Optimizer,
     scheduler: torch.optim.lr_scheduler.LRScheduler,
-    device: torch.device, ) -> tuple[float, float]:
+    device: torch.device,
+    scaler: torch.amp.GradScaler | None = None
+) -> tuple[float, float]:
     model.train()
     total_loss = 0.0
     total_correct = 0
     total_seen = 0
-
+    use_autocast = device.type == "cuda"
     for x, y in loader:
         x = x.to(device)
         y = y.to(device)
         optimizer.zero_grad(set_to_none=True)
-        logits = model(x)
-        loss = F.cross_entropy(logits, y, label_smoothing=0.03)
-        loss.backward()
-        optimizer.step()
+        with torch.amp.autocast(device_type=device.type, enabled=use_autocast):
+            logits = model(x)
+            loss = F.cross_entropy(logits, y, label_smoothing=0.03)
+            
+        if scaler is not None:
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
+
+        else:
+            loss.backward()
+            optimizer.step()
+
         scheduler.step()
 
         batch_size = y.size(0)
@@ -281,7 +304,7 @@ def main() -> None:
     parser.add_argument("--val-fraction", type=float, default=0.15)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--num-workers", type=int, default=0)
-    parser.add_argument("--device", choices=["auto", "cpu", "cuda"], default="auto")
+    parser.add_argument("--device", choices=["auto", "cpu", "cuda", "mps"], default="auto")
     parser.add_argument("--skip-training", action="store_true")
     parser.add_argument(
         "--model-paths",
@@ -303,7 +326,7 @@ def main() -> None:
     print(f"Using {device}")
 
     model = DigitCNN().to(device)
-
+    scaler = torch.amp.GradScaler(device="cuda") if device.type == "cuda" else None    
     if skip_training:
         paths_to_load = model_paths if model_paths else [cfg.model_path]
         missing_models = [str(path) for path in paths_to_load if not path.exists()]
@@ -344,7 +367,7 @@ def main() -> None:
         best_val_loss = float("inf")
         best_epoch = 0
         for epoch in range(1, cfg.epochs + 1):
-            train_loss, train_acc = train_one_epoch(model, train_loader, optimizer, scheduler, device)
+            train_loss, train_acc = train_one_epoch(model, train_loader, optimizer, scheduler, device, scaler)
             val_loss, val_acc = evaluate(model, val_loader, device)
             print(
                 f"epoch {epoch:02d}/{cfg.epochs} "
