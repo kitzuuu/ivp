@@ -42,9 +42,9 @@ def resolve_device(device: str) -> torch.device:
         return torch.device("cuda" if torch.cuda.is_available() else "cpu")
     if device == "cuda" and not torch.cuda.is_available():
         raise RuntimeError(
-            "CUDA was requested, but this PyTorch install cannot use CUDA. "
-            f"torch={torch.__version__}, torch.version.cuda={torch.version.cuda!r}. "
-            "Install a CUDA-enabled PyTorch wheel in this Python environment."
+            "CUDA cannot be used"
+            f"torch={torch.__version__}, torch.version.cuda={torch.version.cuda!r} "
+            "No CUDA installation found"
         )
     return torch.device(device)
 
@@ -83,16 +83,14 @@ class HindiDigitDataset(Dataset):
                 x = self._translate(x, max_shift=3)
 
         label = self.labels[index]
-        if label is None:
-            return x
+        if label is None: return x
         return x, torch.tensor(label, dtype=torch.long)
 
     @staticmethod
     def _translate(x: torch.Tensor, max_shift: int) -> torch.Tensor:
         dx = random.randint(-max_shift, max_shift)
         dy = random.randint(-max_shift, max_shift)
-        if dx == 0 and dy == 0:
-            return x
+        if dx == 0 and dy == 0: return x
 
         shifted = torch.full_like(x, -1.0)
         _, height, width = x.shape
@@ -171,8 +169,7 @@ def train_one_epoch(
     loader: DataLoader,
     optimizer: torch.optim.Optimizer,
     scheduler: torch.optim.lr_scheduler.LRScheduler,
-    device: torch.device,
-) -> tuple[float, float]:
+    device: torch.device, ) -> tuple[float, float]:
     model.train()
     total_loss = 0.0
     total_correct = 0
@@ -197,8 +194,7 @@ def train_one_epoch(
 
 
 def shift_batch(x: torch.Tensor, dx: int, dy: int) -> torch.Tensor:
-    if dx == 0 and dy == 0:
-        return x
+    if dx == 0 and dy == 0: return x
 
     shifted = torch.full_like(x, -1.0)
     _, _, height, width = x.shape
@@ -235,24 +231,39 @@ def evaluate(model: nn.Module, loader: DataLoader, device: torch.device) -> tupl
 
 
 @torch.no_grad()
-def predict(model: nn.Module, loader: DataLoader, device: torch.device) -> np.ndarray:
+def predict_proba(model: nn.Module, loader: DataLoader, device: torch.device) -> np.ndarray:
     model.eval()
-    predictions = []
+    probabilities = []
 
     for x in loader:
         x = x.to(device)
-        # Cheap test-time augmentation: original plus four one-pixel shifts.
         variants = [
             x,
             shift_batch(x, dx=0, dy=1),
             shift_batch(x, dx=0, dy=-1),
             shift_batch(x, dx=1, dy=0),
             shift_batch(x, dx=-1, dy=0),
+            shift_batch(x, dx=1, dy=1),
+            shift_batch(x, dx=1, dy=-1),
+            shift_batch(x, dx=-1, dy=1),
+            shift_batch(x, dx=-1, dy=-1),
         ]
         logits = torch.stack([model(v) for v in variants]).mean(dim=0)
-        predictions.extend(logits.argmax(dim=1).cpu().numpy().tolist())
+        probabilities.append(logits.softmax(dim=1).cpu().numpy())
 
-    return np.asarray(predictions, dtype=np.int64)
+    return np.concatenate(probabilities, axis=0)
+
+
+@torch.no_grad()
+def predict(model: nn.Module, loader: DataLoader, device: torch.device) -> np.ndarray:
+    return predict_proba(model, loader, device).argmax(axis=1).astype(np.int64)
+
+
+def load_model(model_path: Path, device: torch.device) -> DigitCNN:
+    model = DigitCNN().to(device)
+    model.load_state_dict(torch.load(model_path, map_location=device))
+    model.eval()
+    return model
 
 
 def main() -> None:
@@ -272,22 +283,33 @@ def main() -> None:
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--device", choices=["auto", "cpu", "cuda"], default="auto")
     parser.add_argument("--skip-training", action="store_true")
+    parser.add_argument(
+        "--model-paths",
+        type=Path,
+        nargs="*",
+        default=None,
+        help="Optional list of checkpoints to average at prediction time.",
+    )
     args = parser.parse_args()
     skip_training = args.skip_training
+    model_paths = args.model_paths
     cfg_args = vars(args)
     cfg_args.pop("skip_training")
+    cfg_args.pop("model_paths")
     cfg = Config(**cfg_args)
 
     set_seed(cfg.seed)
     device = resolve_device(cfg.device)
-    print(f"Using device: {device}")
+    print(f"Using {device}")
 
     model = DigitCNN().to(device)
 
     if skip_training:
-        if not cfg.model_path.exists():
-            raise FileNotFoundError(f"Cannot skip training because {cfg.model_path} does not exist")
-        print(f"Skipping training and loading {cfg.model_path}")
+        paths_to_load = model_paths if model_paths else [cfg.model_path]
+        missing_models = [str(path) for path in paths_to_load if not path.exists()]
+        if missing_models:
+            raise FileNotFoundError(f"Missing model checkpoint: {missing_models[0]}")
+        print(f"Skipping training and loading {len(paths_to_load)} checkpoint(s)")
     else:
         df = pd.read_csv(cfg.train_csv)
         train_df, val_df = stratified_split(df, cfg.val_fraction, cfg.seed)
@@ -319,6 +341,7 @@ def main() -> None:
         )
 
         best_acc = 0.0
+        best_val_loss = float("inf")
         best_epoch = 0
         for epoch in range(1, cfg.epochs + 1):
             train_loss, train_acc = train_one_epoch(model, train_loader, optimizer, scheduler, device)
@@ -328,14 +351,17 @@ def main() -> None:
                 f"train_loss={train_loss:.4f} train_acc={train_acc:.4f} "
                 f"val_loss={val_loss:.4f} val_acc={val_acc:.4f}"
             )
-            if val_acc > best_acc:
+            if val_acc > best_acc or (val_acc == best_acc and val_loss < best_val_loss):
                 best_acc = val_acc
+                best_val_loss = val_loss
                 best_epoch = epoch
                 torch.save(model.state_dict(), cfg.model_path)
 
-        print(f"Best validation accuracy: {best_acc:.4f} at epoch {best_epoch}")
-
-    model.load_state_dict(torch.load(cfg.model_path, map_location=device))
+        print(
+            f"Best checkpoint: epoch {best_epoch} "
+            f"val_acc={best_acc:.4f} val_loss={best_val_loss:.4f}"
+        )
+        paths_to_load = model_paths if model_paths else [cfg.model_path]
 
     test_df = pd.read_csv(cfg.test_csv)
     test_records = [(cfg.test_dir / f"{int(row.Id)}.png", None) for row in test_df.itertuples(index=False)]
@@ -350,9 +376,16 @@ def main() -> None:
         num_workers=cfg.num_workers,
         pin_memory=device.type == "cuda",
     )
-    test_df["Category"] = predict(model, test_loader, device)
+
+    summed_proba = None
+    for path in paths_to_load:
+        model = load_model(path, device)
+        proba = predict_proba(model, test_loader, device)
+        summed_proba = proba if summed_proba is None else summed_proba + proba
+
+    test_df["Category"] = summed_proba.argmax(axis=1).astype(np.int64)
     test_df[["Id", "Category"]].to_csv(cfg.submission_path, index=False, quoting=csv.QUOTE_MINIMAL)
-    print(f"Wrote {cfg.submission_path}")
+    print(f"Written {cfg.submission_path}")
 
 
 if __name__ == "__main__":
